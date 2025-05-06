@@ -357,7 +357,7 @@ private:
     
     bool send_plain(const std::string& request) {
         // Simple sending, not handling partial sends for brevity
-        int bytes_sent = send(socket_, request.c_str(), request.length(), 0);
+        int bytes_sent = ::send(socket_, request.c_str(), request.length(), 0);
         return bytes_sent == static_cast<int>(request.length());
     }
     
@@ -451,7 +451,7 @@ public:
             return false;
         }
         
-        int bytes_sent = sendto(socket_, data.c_str(), data.length(), 0,
+        int bytes_sent = ::sendto(socket_, data.c_str(), data.length(), 0,
                                (struct sockaddr*)&server_addr_, sizeof(server_addr_));
         
         return bytes_sent == static_cast<int>(data.length());
@@ -937,7 +937,10 @@ public:
      * @param value Amount to increment
      */
     void increment(double value = 1.0) {
-        value_.fetch_add(value, std::memory_order_relaxed);
+        // For floating-point atomics, we need to use load/store
+        double current = value_.load(std::memory_order_relaxed);
+        double desired = current + value;
+        value_.store(desired, std::memory_order_relaxed);
     }
     
     /**
@@ -945,7 +948,10 @@ public:
      * @param value Amount to decrement
      */
     void decrement(double value = 1.0) {
-        value_.fetch_sub(value, std::memory_order_relaxed);
+        // For floating-point atomics, we need to use load/store
+        double current = value_.load(std::memory_order_relaxed);
+        double desired = current - value;
+        value_.store(desired, std::memory_order_relaxed);
     }
     
     /**
@@ -1037,8 +1043,11 @@ public:
         : Metric(name, description, MetricType::Histogram),
           buckets_(buckets), count_(0), sum_(0.0) {
         
-        // Initialize bucket counters
-        bucket_counts_.resize(buckets.size() + 1, 0);  // +1 for +Inf bucket
+        // Initialize bucket counters with a thread-safe approach
+        // Using a vector of pointers to atomics to avoid copying atomics
+        for (size_t i = 0; i <= buckets.size(); ++i) {  // +1 for the +Inf bucket
+            bucket_counts_.push_back(std::make_unique<std::atomic<int64_t>>(0));
+        }
     }
     
     /**
@@ -1047,18 +1056,22 @@ public:
      */
     void observe(double value) {
         count_.fetch_add(1, std::memory_order_relaxed);
-        sum_.fetch_add(value, std::memory_order_relaxed);
+        
+        // For floating-point atomics, we need to use load/store
+        double current_sum = sum_.load(std::memory_order_relaxed);
+        double new_sum = current_sum + value;
+        sum_.store(new_sum, std::memory_order_relaxed);
         
         // Update bucket counts
         for (size_t i = 0; i < buckets_.size(); ++i) {
             if (value <= buckets_[i]) {
-                bucket_counts_[i].fetch_add(1, std::memory_order_relaxed);
+                bucket_counts_[i]->fetch_add(1, std::memory_order_relaxed);
                 break;
             }
         }
         
         // Always update the +Inf bucket
-        bucket_counts_.back().fetch_add(1, std::memory_order_relaxed);
+        bucket_counts_.back()->fetch_add(1, std::memory_order_relaxed);
     }
     
     /**
@@ -1093,8 +1106,8 @@ public:
         std::vector<int64_t> counts;
         counts.reserve(bucket_counts_.size());
         
-        for (const auto& count : bucket_counts_) {
-            counts.push_back(count.load(std::memory_order_relaxed));
+        for (const auto& count_ptr : bucket_counts_) {
+            counts.push_back(count_ptr->load(std::memory_order_relaxed));
         }
         
         return counts;
@@ -1212,7 +1225,7 @@ public:
     
 private:
     std::vector<double> buckets_;
-    std::vector<std::atomic<int64_t>> bucket_counts_;
+    std::vector<std::unique_ptr<std::atomic<int64_t>>> bucket_counts_;
     std::atomic<int64_t> count_;
     std::atomic<double> sum_;
 };
